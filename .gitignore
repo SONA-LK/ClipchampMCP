@@ -3,3 +3,4 @@ dist/
 scratch/
 Videos/
 *.log
+.devin/mcp_config.local.json
