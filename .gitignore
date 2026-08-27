@@ -4,3 +4,13 @@ scratch/
 Videos/
 *.log
 .devin/mcp_config.local.json
+
+# Debug/test scripts
+debug_*.ts
+check_pages*.ts
+explore_all*.ts
+gohome.ts
+test_creative.ts
+test_filter_only.ts
+poc_*.ts
+COMMIT_MSG.txt
