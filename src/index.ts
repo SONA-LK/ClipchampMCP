@@ -283,7 +283,7 @@ class ClipchampMCPServer {
         {
           name: "add_text",
           description:
-            "Add a text overlay/title to the timeline. The text style determines the visual appearance and animation.",
+            "Add a text overlay/title to the timeline as an overlay on track 2. The text style determines the visual appearance and animation.",
           inputSchema: {
             type: "object",
             properties: {
@@ -295,6 +295,25 @@ class ClipchampMCPServer {
               },
             },
             required: ["text"],
+          },
+        },
+        {
+          name: "set_text_position",
+          description:
+            "Set the position of a text overlay on the video. Uses a 3x3 grid: top-left, top-center, top-right, middle-left, middle-center, middle-right, bottom-left, bottom-center, bottom-right. The text clip must be selected first (use select_timeline_item).",
+          inputSchema: {
+            type: "object",
+            properties: {
+              position: {
+                type: "string",
+                enum: [
+                  "top-left", "top-center", "top-right",
+                  "middle-left", "middle-center", "middle-right",
+                  "bottom-left", "bottom-center", "bottom-right",
+                ],
+                description: "Grid position for the text overlay. Default: bottom-center (typical subtitle position).",
+              },
+            },
           },
         },
         {
@@ -373,6 +392,10 @@ class ClipchampMCPServer {
             const text = request.params.arguments?.text as string;
             const style = (request.params.arguments?.style as string) || "Text";
             return await this.addText(text, style);
+          }
+          case "set_text_position": {
+            const position = (request.params.arguments?.position as string) || "bottom-center";
+            return await this.setTextPosition(position);
           }
           case "set_duration": {
             const seconds = request.params.arguments?.seconds as number;
@@ -702,77 +725,81 @@ class ClipchampMCPServer {
       }
       console.error(`[importMedia] sidebar nav ready: ${navReady}, page URL: ${page.url()}`);
 
-      // Click the "My media" sidebar nav button using Playwright's locator
-      // (locator.click triggers React handlers, mouse.click does not).
-      // The sidebar might already be open from a previous session, so we
-      // click twice: first to close (if open), then to open fresh.
-      const myMediaBtn = page.getByRole("button", { name: "My media" });
+      // Click the "My media" sidebar nav button.
+      // Use a scoped locator inside the sidebar navigation to avoid matching
+      // other elements with "My media" text (like headings inside the sidebar).
+      const sidebarNav = page.locator('[aria-label="Sidebar navigation"]');
+      const myMediaBtn = sidebarNav.locator('button[aria-label="My media"]');
       await myMediaBtn.click({ timeout: 10000 }).catch(() => {});
-      await sleep(1000);
+      await sleep(2000);
+
       // Check if the Import media button is visible now
       let sidebarOpen = await page.locator("button").filter({ hasText: "Import media" }).first().isVisible({ timeout: 3000 }).catch(() => false);
       if (!sidebarOpen) {
-        // Click again to toggle
-        await myMediaBtn.click({ timeout: 10000 }).catch(() => {});
-        await sleep(2000);
-        sidebarOpen = await page.locator("button").filter({ hasText: "Import media" }).first().isVisible({ timeout: 3000 }).catch(() => false);
-      }
-      if (!sidebarOpen) {
-        // Try clicking another tab first, then back to My media
-        await page.getByRole("button", { name: "Text" }).click({ timeout: 10000 }).catch(() => {});
+        // The sidebar might be in a weird state. Click another tab, then back.
+        await sidebarNav.locator('button[aria-label="Text"]').click({ timeout: 10000 }).catch(() => {});
         await sleep(1500);
         await myMediaBtn.click({ timeout: 10000 }).catch(() => {});
         await sleep(3000);
+        sidebarOpen = await page.locator("button").filter({ hasText: "Import media" }).first().isVisible({ timeout: 3000 }).catch(() => false);
+      }
+      if (!sidebarOpen) {
+        // Last resort: try force-clicking the Import media button even if "not visible"
+        // (the button might be in a collapsed panel that's technically in the DOM)
+        console.error(`[importMedia] sidebar still not open, trying force click...`);
       }
 
       // Open the native file picker via the "Import media" button.
       // We need to use Playwright's locator click (not mouse.click) to trigger
-      // the filechooser event in WebView2. Try multiple locator strategies.
-      let importBtn = page.locator("button").filter({ hasText: "Import media" }).first();
-      let importVisible = await importBtn.isVisible({ timeout: 5000 }).catch(() => false);
+      // the filechooser event in WebView2.
+      const importBtn = page.locator("button").filter({ hasText: "Import media" }).first();
+      // Scroll into view first
+      await importBtn.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
 
-      if (!importVisible) {
-        // Try by text content
-        importBtn = page.getByText("Import media", { exact: true }).first();
-        importVisible = await importBtn.isVisible({ timeout: 5000 }).catch(() => false);
-      }
-
-      if (!importVisible) {
-        // Try by evaluating and clicking via Playwright's locator on the found element
-        // Use the nth button that contains "Import media" text
-        const btnCount = await page.locator("button").count().catch(() => 0);
-        for (let i = 0; i < btnCount; i++) {
-          const text = await page.locator("button").nth(i).textContent().catch(() => "");
-          if (text && text.includes("Import media") && text.length < 30) {
-            importBtn = page.locator("button").nth(i);
-            importVisible = true;
-            break;
-          }
+      // Try normal click first (works when sidebar is properly open)
+      let filechooser: any = null;
+      try {
+        const [fc] = await Promise.all([
+          page.waitForEvent("filechooser", { timeout: 15000 }),
+          importBtn.click({ timeout: 10000 }),
+        ]);
+        filechooser = fc;
+      } catch {
+        // If normal click fails (button not visible), try force: true
+        console.error(`[importMedia] normal click failed, trying force click...`);
+        try {
+          const [fc] = await Promise.all([
+            page.waitForEvent("filechooser", { timeout: 15000 }),
+            importBtn.click({ timeout: 10000, force: true }),
+          ]);
+          filechooser = fc;
+        } catch (e2: any) {
+          throw new Error("Could not find the 'Import media' button. Make sure the My media sidebar is open.");
         }
       }
-
-      if (!importVisible) {
-        throw new Error("Could not find the 'Import media' button. Make sure the My media sidebar is open.");
-      }
-
-      const [filechooser] = await Promise.all([
-        page.waitForEvent("filechooser", { timeout: 15000 }),
-        importBtn.click({ timeout: 10000 }),
-      ]);
       await filechooser.setFiles(filePaths);
 
-      // Wait for the imported items to show up in the sidebar (aria-label == basename).
+      // Wait for the imported items to show up in the sidebar.
+      // Use waitFor with state "attached" (not "visible") since the sidebar
+      // panel might be technically in the DOM but not fully visible.
       const basenames = filePaths.map((f) => path.basename(f));
       for (const name of basenames) {
-        await page.locator(`[aria-label="${name}"]`).waitFor({ state: "visible", timeout: 60000 });
+        await page.locator(`[aria-label="${name}"]`).waitFor({ state: "attached", timeout: 60000 });
       }
-      await sleep(1500);
+      await sleep(2000);
 
       // Add each imported media item to the timeline in order.
+      // Use force: true since the sidebar might not be fully visible.
       for (const name of basenames) {
         const addBtn = page.getByRole("button", { name: `Add ${name} to timeline` });
-        await addBtn.click({ timeout: 15000 });
-        await sleep(1200);
+        await addBtn.click({ timeout: 15000, force: true }).catch(() => {
+          // Fallback: try clicking via evaluate
+          page.evaluate((n) => {
+            const btn = document.querySelector(`button[aria-label="Add ${n} to timeline"]`) as HTMLElement;
+            btn?.click();
+          }, name);
+        });
+        await sleep(1500);
       }
       await sleep(2000);
 
@@ -937,20 +964,24 @@ class ClipchampMCPServer {
   // Click a sidebar navigation button by its aria-label (e.g. "Transitions", "Text", "My media").
   // Uses mouse.click for a real click event — evaluate .click() doesn't trigger React handlers.
   private async clickSidebarNav(page: Page, ariaLabel: string): Promise<void> {
-    const pos = await page.evaluate((label) => {
-      const nav = document.querySelector('[aria-label="Sidebar navigation"]');
-      if (!nav) return null;
-      for (const b of nav.querySelectorAll("button")) {
-        if (b.getAttribute("aria-label") === label || b.textContent?.includes(label)) {
-          const r = b.getBoundingClientRect();
-          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    // Use Playwright's locator click (triggers React handlers, unlike mouse.click)
+    const nav = page.locator('[aria-label="Sidebar navigation"]');
+    const btn = nav.locator(`button[aria-label="${ariaLabel}"]`);
+    await btn.click({ timeout: 10000 }).catch(async () => {
+      // Fallback: find via evaluate and use mouse.click
+      const pos = await page.evaluate((label) => {
+        const nav = document.querySelector('[aria-label="Sidebar navigation"]');
+        if (!nav) return null;
+        for (const b of nav.querySelectorAll("button")) {
+          if (b.getAttribute("aria-label") === label || b.textContent?.includes(label)) {
+            const r = b.getBoundingClientRect();
+            return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+          }
         }
-      }
-      return null;
-    }, ariaLabel);
-    if (pos) {
-      await page.mouse.click(pos.x, pos.y);
-    }
+        return null;
+      }, ariaLabel);
+      if (pos) await page.mouse.click(pos.x, pos.y);
+    });
   }
 
   private async getTimelineClipCount(page: Page): Promise<number> {
@@ -1249,10 +1280,16 @@ class ClipchampMCPServer {
       await this.clickSidebarNav(page, "Transitions");
       await sleep(3000);
 
-      // Step 2: Click the "Add transition" zone between the specified clips.
-      // This selects the gap where the transition will go.
+      // Step 2: Scroll timeline to beginning to ensure the dropzone is visible
+      await page.evaluate(() => {
+        const allEls = document.querySelectorAll("*");
+        for (const el of allEls) { const h = el as HTMLElement; if (h.scrollLeft > 0) h.scrollLeft = 0; }
+      });
+      await sleep(1000);
+
+      // Step 3: Find the transition dropzone between the specified clips
       const zoneBox = await page.evaluate((targetIdx) => {
-        const zones = document.querySelectorAll('[aria-label="Add transition"]');
+        const zones = document.querySelectorAll('[data-testid="transition-dropzone-button"]');
         if (targetIdx >= zones.length) return null;
         const el = zones[targetIdx] as HTMLElement;
         const r = el.getBoundingClientRect();
@@ -1263,25 +1300,46 @@ class ClipchampMCPServer {
         throw new Error(`No transition dropzone found between clip ${betweenClip} and clip ${betweenClip + 1}. Make sure there are at least ${betweenClip + 2} clips on the timeline.`);
       }
 
-      // Real mouse click on the zone (not evaluate click — that doesn't trigger React handlers)
-      await page.mouse.click(zoneBox.x, zoneBox.y);
-      await sleep(2000);
+      // Step 4: Find the transition button in the sidebar
+      const transBtnPos = await page.evaluate((transName) => {
+        const btn = document.querySelector(`button[aria-label="${transName}"]`) as HTMLElement;
+        if (!btn) return null;
+        btn.scrollIntoView({ block: "center" });
+        const r = btn.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }, transition);
 
-      // Step 3: Click the transition button in the sidebar — same as clicking "Add to timeline" for media
-      const transBtn = page.locator(`button[aria-label="${transition}"]`).first();
-      const transBox = await transBtn.boundingBox();
-      if (!transBox) {
+      if (!transBtnPos) {
         throw new Error(`Transition "${transition}" not found in the sidebar.`);
       }
-      await page.mouse.click(transBox.x + transBox.width / 2, transBox.y + transBox.height / 2);
+
+      // Step 5: Drag the transition button to the dropzone.
+      // This is the only reliable way to add a transition — clicking the
+      // dropzone or the transition button does not work in WebView2.
+      // We use page.mouse with small steps to simulate a real drag-and-drop.
+      await page.mouse.move(transBtnPos.x, transBtnPos.y);
+      await sleep(500);
+      await page.mouse.down();
+      await sleep(300);
+
+      // Move in small steps to simulate real dragging
+      const steps = 40;
+      for (let i = 1; i <= steps; i++) {
+        const x = transBtnPos.x + (zoneBox.x - transBtnPos.x) * i / steps;
+        const y = transBtnPos.y + (zoneBox.y - transBtnPos.y) * i / steps;
+        await page.mouse.move(x, y);
+        await sleep(30);
+      }
+      await sleep(500);
+      await page.mouse.up();
       await sleep(3000);
 
-      // Verify the transition was added — wait a bit longer and check
+      // Step 6: Verify the transition was added
       await sleep(2000);
       const added = await page.evaluate(() => {
         const tl = document.querySelector('[aria-label="Timeline"]');
         if (!tl) return false;
-        // Check for transition elements (data-testid="transition" or aria-label containing "Transition")
+        // Check for transition elements (data-testid="transition" without "empty-")
         const transitions = tl.querySelectorAll('[data-testid="transition"]');
         if (transitions.length > 0) return true;
         // Fallback: check if any element has aria-label mentioning a transition type
@@ -1319,30 +1377,97 @@ class ClipchampMCPServer {
     try {
       await page.bringToFront().catch(() => {});
 
-      // Open the Text sidebar via the nav button
+      // Step 1: Move the playhead to the beginning of the timeline (0.00s).
+      // This ensures the text is added at the start, not at the end.
+      await page.evaluate(() => {
+        const tl = document.querySelector('[aria-label="Timeline"]');
+        if (tl) { tl.scrollLeft = 0; }
+      });
+      await sleep(500);
+      // Click at the beginning of the timeline to move the playhead
+      const tlBox = await page.evaluate(() => {
+        const tl = document.querySelector('[aria-label="Timeline"]');
+        if (!tl) return null;
+        const rect = tl.getBoundingClientRect();
+        return { x: rect.x, y: rect.y };
+      });
+      if (tlBox) {
+        await page.mouse.click(tlBox.x + 50, tlBox.y + 100);
+        await sleep(1000);
+      }
+
+      // Step 2: Open the Text sidebar via the nav button
       await this.clickSidebarNav(page, "Text");
       await sleep(3000);
 
-      // Click the "Add <style> to timeline" button — this adds the text clip
-      // to the timeline without needing a drag-and-drop.
-      const addBtn = page.locator(`button[aria-label="Add ${style} to timeline"]`).first();
-      const btnBox = await addBtn.boundingBox().catch(() => null);
-      if (!btnBox) {
+      // Wait for the "Add <style> to timeline" button to appear
+      let btnExists = await page.locator(`button[aria-label="Add ${style} to timeline"]`).count().catch(() => 0);
+      if (btnExists === 0) {
+        // The Text sidebar might not have opened. Try toggling.
+        await this.clickSidebarNav(page, "My media");
+        await sleep(1500);
+        await this.clickSidebarNav(page, "Text");
+        await sleep(3000);
+        btnExists = await page.locator(`button[aria-label="Add ${style} to timeline"]`).count().catch(() => 0);
+      }
+      if (btnExists === 0) {
         throw new Error(`Text style "${style}" not found. Use list_options to see available styles.`);
       }
-      // Use mouse.click for a real click event (evaluate click doesn't trigger React handlers)
-      await page.mouse.click(btnBox.x + btnBox.width / 2, btnBox.y + btnBox.height / 2);
+
+      // Step 3: Add the text to the timeline.
+      // Use native .click() via evaluate — this reliably triggers React's
+      // synthetic onClick handler (Playwright's locator.click and mouse.click
+      // do not always trigger it in WebView2).
+      await page.evaluate((styleName) => {
+        const btn = document.querySelector(`button[aria-label="Add ${styleName} to timeline"]`) as HTMLElement;
+        if (btn) {
+          btn.scrollIntoView({ block: "center" });
+          btn.click();
+        }
+      }, style);
       await sleep(3000);
 
-      // The text clip is now on the timeline and selected.
-      // The stage shows "Add your text here" — we need to edit it.
-      // Double-click the text on the stage to enter edit mode, then type.
-      const stage = page.locator('[aria-label="Stage"]');
-      // Find the text element on the stage and double-click it
+      // Step 4: Move the text clip from track 1 to track 2 (overlay track).
+      // "Add to timeline" adds text to track 1 at the playhead position.
+      // We use the keyboard shortcut KeyX + ArrowDown to move it down a track.
+      // First, find and click the text clip to select it.
+      const clipPos = await page.evaluate(() => {
+        const tl = document.querySelector('[aria-label="Timeline"]');
+        if (!tl) return null;
+        const allEls = tl.querySelectorAll("*");
+        let best: any = null;
+        for (const el of allEls) {
+          const t = el.textContent || "";
+          // Look for the text clip on track 1 (it contains the style name or "Subtitle")
+          if (t.includes("track 1") && t.includes("Start time") && el.children.length < 8) {
+            const rect = (el as HTMLElement).getBoundingClientRect();
+            const area = rect.width * rect.height;
+            if (rect.width > 20 && rect.height > 10 && area > 0) {
+              if (!best || area < best.area) {
+                best = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, area };
+              }
+            }
+          }
+        }
+        return best;
+      });
+
+      if (clipPos) {
+        await page.mouse.click(clipPos.x, clipPos.y);
+        await sleep(2000);
+
+        // KeyX + ArrowDown moves the selected clip down one track
+        await page.keyboard.down("x");
+        await page.keyboard.press("ArrowDown");
+        await page.keyboard.up("x");
+        await sleep(2000);
+      }
+
+      // Step 5: Edit the text content on the stage.
+      // The stage shows "Add your text here" — double-click to edit.
       const textElPos = await page.evaluate(() => {
         const stage = document.querySelector('[aria-label="Stage"]');
         if (!stage) return null;
-        // Look for the text overlay element on the stage
         const textEls = stage.querySelectorAll('[contenteditable], [role="textbox"], p, span, div');
         for (const el of textEls) {
           const text = el.textContent || "";
@@ -1351,37 +1476,189 @@ class ClipchampMCPServer {
             return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
           }
         }
-        // Fallback: look for any element in the center of the stage
         const stageRect = stage.getBoundingClientRect();
         return { x: stageRect.x + stageRect.width / 2, y: stageRect.y + stageRect.height / 2 };
       });
 
       if (textElPos) {
-        // Double-click to enter text edit mode
         await page.mouse.click(textElPos.x, textElPos.y, { clickCount: 2 });
         await sleep(1000);
-
-        // Select all existing text and replace with our text
         await page.keyboard.press("Control+a");
         await sleep(200);
         await page.keyboard.type(text);
         await sleep(500);
-        // Press Escape to exit edit mode
         await page.keyboard.press("Escape");
         await sleep(1000);
       }
 
-      // Go back to My media sidebar
-      await this.clickSidebarNav(page, "My media");
-      await sleep(1500);
+      // The text clip remains selected with its property panel open.
+      // Do NOT switch to My media sidebar — that would close the property panel.
+      // The caller can use set_text_position to adjust the overlay position.
 
       return {
         content: [
-          { type: "text", text: `Added text "${text}" with style "${style}" to the timeline.` },
+          { type: "text", text: `Added text "${text}" with style "${style}" to the timeline as an overlay on track 2. The text clip is selected — use set_text_position to adjust its position.` },
         ],
       };
     } catch (error: any) {
       return { isError: true, content: [{ type: "text", text: `Failed to add text: ${error.message}` }] };
+    }
+  }
+
+  private async setTextPosition(position: string) {
+    const page = await this.requirePage();
+    try {
+      await page.bringToFront().catch(() => {});
+
+      // Map position string to grid index (0-8)
+      // Grid layout:
+      //   0=top-left    1=top-center    2=top-right
+      //   3=middle-left 4=middle-center 5=middle-right
+      //   6=bottom-left 7=bottom-center 8=bottom-right
+      const positionMap: Record<string, number> = {
+        "top-left": 0, "top-center": 1, "top-right": 2,
+        "middle-left": 3, "middle-center": 4, "middle-right": 5,
+        "bottom-left": 6, "bottom-center": 7, "bottom-right": 8,
+      };
+      const gridIndex = positionMap[position];
+      if (gridIndex === undefined) {
+        throw new Error(`Invalid position "${position}". Use one of: ${Object.keys(positionMap).join(", ")}`);
+      }
+
+      // Make sure the Text tab is active in the property panel.
+      // First, check if the property panel has the "Text" tab (text clip selected).
+      let tabs = await page.evaluate(() => {
+        const nav = document.querySelector('[aria-label="Property panel navigation"]');
+        return nav ? Array.from(nav.querySelectorAll("[aria-label]")).map((e: any) => e.getAttribute("aria-label")) : [];
+      });
+      console.error(`[setTextPosition] current tabs: ${JSON.stringify(tabs)}`);
+
+      // If the Text tab is not available, the text clip isn't selected.
+      // Find and click the text clip on track 2.
+      if (!tabs.includes("Text")) {
+        console.error(`[setTextPosition] Text tab not found, selecting text clip...`);
+        // Scroll timeline to beginning
+        await page.evaluate(() => {
+          const allEls = document.querySelectorAll("*");
+          for (const el of allEls) { const h = el as HTMLElement; if (h.scrollLeft > 0) h.scrollLeft = 0; }
+        });
+        await sleep(1000);
+
+        // Try clicking the text clip up to 5 times
+        for (let attempt = 0; attempt < 5 && !tabs.includes("Text"); attempt++) {
+          // Find the text clip on track 2 and click it.
+          // Use the leftmost part of the clip (x = clip.x + 20) to avoid
+          // overlapping with track 1 clips in the center of the timeline.
+          const clipPos = await page.evaluate(() => {
+            const tl = document.querySelector('[aria-label="Timeline"]');
+            if (!tl) return null;
+            const allEls = tl.querySelectorAll("*");
+            let best: any = null;
+            for (const el of allEls) {
+              const t = el.textContent || "";
+              if (t.includes("track 2") && t.includes("Start time") && el.children.length < 8) {
+                const rect = (el as HTMLElement).getBoundingClientRect();
+                const area = rect.width * rect.height;
+                if (rect.width > 20 && rect.height > 10 && area > 0) {
+                  if (!best || area < best.area) {
+                    best = { x: rect.x + 20, y: rect.y + rect.height / 2, area };
+                  }
+                }
+              }
+            }
+            return best;
+          });
+
+          if (clipPos) {
+            // If the clip is off-screen (x < 0), scroll the timeline to show it
+            if (clipPos.x < 50) {
+              await page.evaluate(() => {
+                const allEls = document.querySelectorAll("*");
+                for (const el of allEls) { const h = el as HTMLElement; if (h.scrollLeft > 0) h.scrollLeft = 0; }
+              });
+              await sleep(1000);
+              // Re-find the clip after scrolling
+              const newPos = await page.evaluate(() => {
+                const tl = document.querySelector('[aria-label="Timeline"]');
+                if (!tl) return null;
+                const allEls = tl.querySelectorAll("*");
+                let best: any = null;
+                for (const el of allEls) {
+                  const t = el.textContent || "";
+                  if (t.includes("track 2") && t.includes("Start time") && el.children.length < 8) {
+                    const rect = (el as HTMLElement).getBoundingClientRect();
+                    const area = rect.width * rect.height;
+                    if (rect.width > 20 && rect.height > 10 && area > 0) {
+                      if (!best || area < best.area) {
+                        best = { x: rect.x + 20, y: rect.y + rect.height / 2, area };
+                      }
+                    }
+                  }
+                }
+                return best;
+              });
+              if (newPos) {
+                clipPos.x = newPos.x;
+                clipPos.y = newPos.y;
+              }
+            }
+
+            await page.mouse.click(clipPos.x, clipPos.y);
+            await sleep(3000);
+            tabs = await page.evaluate(() => {
+              const nav = document.querySelector('[aria-label="Property panel navigation"]');
+              return nav ? Array.from(nav.querySelectorAll("[aria-label]")).map((e: any) => e.getAttribute("aria-label")) : [];
+            });
+            console.error(`[setTextPosition] attempt ${attempt + 1}, tabs: ${JSON.stringify(tabs)}`);
+          } else {
+            break;
+          }
+        }
+      }
+
+      if (!tabs.includes("Text")) {
+        throw new Error(`Text clip not selected and could not be selected. Available tabs: ${JSON.stringify(tabs)}. Make sure a text clip exists on track 2.`);
+      }
+
+      // Click the Text tab (re-click it even if already active to ensure content renders)
+      const nav = page.locator('[aria-label="Property panel navigation"]');
+      await nav.locator('[aria-label="Text"]').click({ timeout: 10000 }).catch(() => {});
+      await sleep(2000);
+
+      // Click the position grid button (data-testid="grid-N")
+      // Wait for the grid buttons to appear (they might take a moment to render)
+      let gridBtn = page.locator(`button[data-testid="grid-${gridIndex}"]`).first();
+      let btnExists = await gridBtn.count().catch(() => 0);
+      for (let i = 0; i < 5 && btnExists === 0; i++) {
+        // Re-click the Text tab to force re-render
+        if (i > 0) {
+          await nav.locator('[aria-label="Text"]').click({ timeout: 10000 }).catch(() => {});
+          await sleep(2000);
+        }
+        gridBtn = page.locator(`button[data-testid="grid-${gridIndex}"]`).first();
+        btnExists = await gridBtn.count().catch(() => 0);
+      }
+      if (btnExists === 0) {
+        throw new Error(`Position grid button not found. The Text property tab might not have position controls.`);
+      }
+
+      // Scroll into view and click using native .click() (reliable for React handlers)
+      await page.evaluate((idx) => {
+        const btn = document.querySelector(`button[data-testid="grid-${idx}"]`) as HTMLElement;
+        if (btn) {
+          btn.scrollIntoView({ block: "center" });
+          btn.click();
+        }
+      }, gridIndex);
+      await sleep(1500);
+
+      return {
+        content: [
+          { type: "text", text: `Set text position to "${position}" (grid-${gridIndex}).` },
+        ],
+      };
+    } catch (error: any) {
+      return { isError: true, content: [{ type: "text", text: `Failed to set text position: ${error.message}` }] };
     }
   }
 
